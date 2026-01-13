@@ -175,6 +175,7 @@ impl AppServerClient {
         cwd: &Path,
         approval_policy: Option<&str>,
         sandbox_policy: Option<Value>,
+        output_schema: Option<Value>,
         model: Option<&str>,
         effort: Option<&str>,
     ) -> Result<TurnOutput> {
@@ -190,6 +191,9 @@ impl AppServerClient {
         }
         if let Some(policy) = sandbox_policy {
             params.insert("sandboxPolicy".to_string(), policy);
+        }
+        if let Some(schema) = output_schema {
+            params.insert("outputSchema".to_string(), schema);
         }
         if let Some(model) = model {
             params.insert("model".to_string(), json!(model));
@@ -213,6 +217,8 @@ impl AppServerClient {
 
         let mut last_message = String::new();
         let mut buffer = String::new();
+        let mut plan_message: Option<String> = None;
+        let mut turn_error: Option<String> = None;
         loop {
             let next = self
                 .next_event()
@@ -224,7 +230,14 @@ impl AppServerClient {
                 .unwrap_or("");
 
             match method {
-                "item/agentMessage/delta" => {
+                _ if method.contains("requestApproval") => {
+                    if let Some(id) = next.get("id").and_then(|value| value.as_u64()) {
+                        let _ = self
+                            .send_response(id, json!({ "decision": "accept" }))
+                            .await;
+                    }
+                }
+                "item/agentMessage/delta" | "item/assistantMessage/delta" => {
                     if let Some(delta) = next
                         .get("params")
                         .and_then(|params| params.get("delta"))
@@ -236,11 +249,39 @@ impl AppServerClient {
                 "item/completed" => {
                     let item = next.get("params").and_then(|params| params.get("item"));
                     if let Some(item) = item {
-                        if item.get("type").and_then(|v| v.as_str()) == Some("agentMessage") {
-                            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                                last_message = text.to_string();
+                        if matches!(
+                            item.get("type").and_then(|v| v.as_str()),
+                            Some("agentMessage") | Some("assistantMessage")
+                        ) {
+                            if let Some(text) = extract_item_text(item) {
+                                last_message = text;
                             }
                         }
+                    }
+                }
+                "turn/plan/updated" => {
+                    if let Some(plan) = next.get("params").and_then(|params| params.get("plan")) {
+                        plan_message = Some(plan.to_string());
+                    }
+                }
+                "error" => {
+                    if let Some(message) = next
+                        .get("params")
+                        .and_then(|params| params.get("error"))
+                        .and_then(|err| err.get("message"))
+                        .and_then(|msg| msg.as_str())
+                    {
+                        turn_error = Some(message.to_string());
+                    }
+                }
+                "codex/event/error" => {
+                    if let Some(message) = next
+                        .get("params")
+                        .and_then(|params| params.get("msg"))
+                        .and_then(|msg| msg.get("message"))
+                        .and_then(|text| text.as_str())
+                    {
+                        turn_error = Some(message.to_string());
                     }
                 }
                 "turn/completed" => {
@@ -258,11 +299,18 @@ impl AppServerClient {
             }
         }
 
-        let output = if !last_message.trim().is_empty() {
+        let output = if let Some(plan) = plan_message {
+            plan
+        } else if !last_message.trim().is_empty() {
             last_message
         } else {
             buffer
         };
+        if output.trim().is_empty() {
+            if let Some(message) = turn_error {
+                return Err(anyhow!("turn failed: {message}"));
+            }
+        }
         Ok(TurnOutput { output, turn_id })
     }
 
@@ -289,6 +337,11 @@ impl AppServerClient {
         self.write_message(payload).await
     }
 
+    async fn send_response(&self, id: u64, result: Value) -> Result<()> {
+        self.write_message(json!({ "id": id, "result": result }))
+            .await
+    }
+
     async fn write_message(&self, value: Value) -> Result<()> {
         let mut stdin = self.stdin.lock().await;
         let mut line = serde_json::to_string(&value)?;
@@ -300,5 +353,25 @@ impl AppServerClient {
     async fn next_event(&self) -> Option<Value> {
         let mut events = self.events.lock().await;
         events.recv().await
+    }
+}
+
+fn extract_item_text(item: &Value) -> Option<String> {
+    if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+        return Some(text.to_string());
+    }
+    let content = item.get("content")?.as_array()?;
+    let mut parts = Vec::new();
+    for entry in content {
+        if entry.get("type").and_then(|v| v.as_str()) == Some("text") {
+            if let Some(text) = entry.get("text").and_then(|v| v.as_str()) {
+                parts.push(text);
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(""))
     }
 }

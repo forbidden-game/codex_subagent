@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio::time::{Duration, timeout};
 
 use crate::agent::{
     AgentConfig, AgentScope, AgentSource, discover_agents, format_agent_list, parse_agent_scope,
@@ -237,17 +238,25 @@ impl SubagentExecutor {
         instruction.push_str("Create a subagent execution plan in JSON.\n");
         instruction.push_str("Output ONLY valid JSON with no extra text.\n");
         instruction.push_str("Max tasks: 10. Use only available agents.\n");
-        instruction.push_str("Format options:\n");
+        instruction.push_str("Do not use placeholders like \"...\" in agent/task/cwd.\n");
+        instruction
+            .push_str("The cwd field is optional; omit it unless you need a specific path.\n");
         instruction.push_str(
-            "{\"mode\":\"single\",\"agent\":\"name\",\"task\":\"...\",\"cwd\":\"...\"}\n",
+            "If unsure, return a single plan with agent \"worker\" and task equal to the user goal.\n",
         );
-        instruction.push_str("{\"mode\":\"parallel\",\"tasks\":[{\"agent\":\"...\",\"task\":\"...\",\"cwd\":\"...\"}]}\n");
-        instruction.push_str("{\"mode\":\"chain\",\"chain\":[{\"agent\":\"...\",\"task\":\"...\",\"cwd\":\"...\"}]}\n");
+        instruction.push_str(
+            "Valid formats: single plan with keys mode/agent/task/(optional cwd), parallel plan with mode/tasks, chain plan with mode/chain.\n",
+        );
         if let Some(prompt) = prompt.as_deref() {
             instruction.push_str("\nWorkflow preset instructions:\n");
             instruction.push_str(prompt);
             instruction.push('\n');
         }
+
+        let agent_names = agent_map.keys().cloned().collect::<Vec<_>>();
+        instruction.push_str("\nAgent names must be one of: ");
+        instruction.push_str(&agent_names.join(", "));
+        instruction.push('\n');
 
         let available = agent_map
             .values()
@@ -258,20 +267,48 @@ impl SubagentExecutor {
         let planner_task =
             format!("{instruction}\nAvailable agents:\n{available}\n\nUser goal:\n{task}");
 
-        let result = self
-            .run_agent_task(
-                cwd,
-                planner,
-                &planner_task,
-                approval_policy,
-                sandbox_mode,
-                None,
+        let mut last_err = None;
+        for attempt in 0..2 {
+            let mut task_text = planner_task.clone();
+            if attempt > 0 {
+                task_text.push_str(
+                    "\nPrevious output was invalid. Return JSON with real agent names and real tasks. Do not use placeholders like \"...\".\n",
+                );
+            }
+            let result = timeout(
+                Duration::from_secs(20),
+                self.run_agent_task(
+                    cwd,
+                    planner,
+                    &task_text,
+                    approval_policy,
+                    sandbox_mode,
+                    None,
+                    Some(""),
+                    None,
+                ),
             )
-            .await?;
-
-        let json_value = parse_json_payload(&result.output)?;
-        validate_plan(&json_value)?;
-        Ok(json_value)
+            .await;
+            match result {
+                Ok(Ok(output)) => match parse_json_payload(&output.output)
+                    .and_then(|value| validate_plan(&value).map(|_| value))
+                {
+                    Ok(value) => return Ok(value),
+                    Err(err) => last_err = Some(err),
+                },
+                Ok(Err(err)) => last_err = Some(err),
+                Err(_) => last_err = Some(anyhow!("planner timed out")),
+            }
+        }
+        let fallback = json!({
+            "mode": "single",
+            "agent": "worker",
+            "task": task
+        });
+        if last_err.is_some() {
+            return Ok(fallback);
+        }
+        Err(anyhow!("planner did not return a valid plan"))
     }
 
     async fn execute_plan(
@@ -504,6 +541,8 @@ impl SubagentExecutor {
         approval_policy: &str,
         sandbox_mode: &str,
         cwd_override: Option<&str>,
+        prompt_prefix: Option<&str>,
+        output_schema: Option<Value>,
     ) -> Result<AgentExecutionResult> {
         let cwd = cwd_override
             .map(PathBuf::from)
@@ -515,6 +554,8 @@ impl SubagentExecutor {
             task,
             approval_policy,
             sandbox_mode,
+            prompt_prefix,
+            output_schema,
         )
         .await
     }
@@ -544,14 +585,33 @@ fn parse_json_payload(output: &str) -> Result<Value> {
     if let Ok(value) = serde_json::from_str(output) {
         return Ok(value);
     }
-    let start = output
-        .find('{')
-        .ok_or_else(|| anyhow!("planner did not return JSON"))?;
-    let end = output
-        .rfind('}')
-        .ok_or_else(|| anyhow!("planner did not return JSON"))?;
-    let slice = &output[start..=end];
-    serde_json::from_str(slice).map_err(|err| anyhow!("failed to parse JSON: {err}"))
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("planner output was empty"));
+    }
+    let start = output.find('{').ok_or_else(|| {
+        anyhow!(
+            "planner did not return JSON. output: {}",
+            truncate_output(trimmed)
+        )
+    })?;
+    let slice = &output[start..];
+    let mut deserializer = serde_json::Deserializer::from_str(slice);
+    Value::deserialize(&mut deserializer).map_err(|err| {
+        anyhow!(
+            "failed to parse JSON: {err}. output: {}",
+            truncate_output(slice)
+        )
+    })
+}
+
+fn truncate_output(output: &str) -> String {
+    let mut text = output.replace('\n', "\\n");
+    if text.len() > 500 {
+        text.truncate(500);
+        text.push_str("...");
+    }
+    text
 }
 
 fn validate_plan(value: &Value) -> Result<()> {
@@ -561,22 +621,70 @@ fn validate_plan(value: &Value) -> Result<()> {
         .unwrap_or("parallel");
     match mode {
         "single" => {
-            if value.get("agent").is_none() || value.get("task").is_none() {
+            let agent = value.get("agent").and_then(|v| v.as_str());
+            let task = value.get("task").and_then(|v| v.as_str());
+            if agent.is_none() || task.is_none() {
                 return Err(anyhow!("single plan requires agent + task"));
+            }
+            if is_placeholder(agent.unwrap()) || is_placeholder(task.unwrap()) {
+                return Err(anyhow!("single plan contains placeholders"));
+            }
+            if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str()) {
+                if is_placeholder(cwd) {
+                    return Err(anyhow!("single plan contains placeholder cwd"));
+                }
             }
         }
         "chain" => {
-            if value.get("chain").and_then(|v| v.as_array()).is_none() {
+            let chain = value.get("chain").and_then(|v| v.as_array());
+            if chain.is_none() {
                 return Err(anyhow!("chain plan requires chain[]"));
+            }
+            for item in chain.unwrap() {
+                validate_task_item(item)?;
             }
         }
         _ => {
-            if value.get("tasks").and_then(|v| v.as_array()).is_none() {
+            let tasks = value.get("tasks").and_then(|v| v.as_array());
+            if tasks.is_none() {
                 return Err(anyhow!("parallel plan requires tasks[]"));
+            }
+            for item in tasks.unwrap() {
+                validate_task_item(item)?;
             }
         }
     }
     Ok(())
+}
+
+fn validate_task_item(item: &Value) -> Result<()> {
+    let agent = item
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("task missing agent"))?;
+    let task = item
+        .get("task")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("task missing task"))?;
+    if is_placeholder(agent) || is_placeholder(task) {
+        return Err(anyhow!("task contains placeholders"));
+    }
+    if let Some(cwd) = item.get("cwd").and_then(|v| v.as_str()) {
+        if is_placeholder(cwd) {
+            return Err(anyhow!("task contains placeholder cwd"));
+        }
+    }
+    Ok(())
+}
+
+fn is_placeholder(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty()
+        || trimmed == "..."
+        || trimmed.contains("...")
+        || (trimmed.starts_with('<') && trimmed.ends_with('>'))
+        || trimmed.contains("<agent>")
+        || trimmed.contains("<task>")
 }
 
 async fn run_task(
@@ -614,6 +722,8 @@ async fn run_task(
         &task.task,
         approval_policy,
         sandbox_mode,
+        None,
+        None,
     )
     .await
 }
@@ -625,6 +735,8 @@ async fn run_task_internal(
     task: &str,
     approval_policy: &str,
     sandbox_mode: &str,
+    prompt_prefix: Option<&str>,
+    output_schema: Option<Value>,
 ) -> Result<AgentExecutionResult> {
     let sandbox = agent
         .sandbox
@@ -639,6 +751,19 @@ async fn run_task_internal(
             "networkAccess": true
         })),
     };
+    let model = agent.model.as_deref().filter(|name| name.contains("codex"));
+
+    let input_task = if let Some(prefix) = prompt_prefix {
+        if prefix.trim().is_empty() {
+            task.to_string()
+        } else {
+            format!("{prefix}\n\n{task}")
+        }
+    } else if agent.system_prompt.trim().is_empty() {
+        task.to_string()
+    } else {
+        format!("{}\n\n{}", agent.system_prompt, task)
+    };
 
     let client = AppServerClient::spawn(codex_bin).await?;
     if let Err(err) = client.initialize().await {
@@ -648,8 +773,8 @@ async fn run_task_internal(
     let thread_id = match client
         .start_thread(
             cwd,
-            Some(agent.system_prompt.as_str()),
-            agent.model.as_deref(),
+            None,
+            model,
             agent.approval_policy.as_deref().or(Some(approval_policy)),
             Some(sandbox.as_str()),
         )
@@ -665,11 +790,12 @@ async fn run_task_internal(
     let turn_output = client
         .run_turn(
             &thread_id,
-            task,
+            &input_task,
             cwd,
             agent.approval_policy.as_deref().or(Some(approval_policy)),
             sandbox_policy,
-            agent.model.as_deref(),
+            output_schema,
+            model,
             agent.effort.as_deref(),
         )
         .await;
