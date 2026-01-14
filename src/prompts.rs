@@ -142,10 +142,3 @@ pub fn discover_prompts(cwd: &Path, scope: AgentScope) -> Vec<PromptDefinition> 
 
     prompt_map.into_values().collect()
 }
-
-pub fn find_prompt(cwd: &Path, scope: AgentScope, name: &str) -> Option<PromptDefinition> {
-    let normalized = name.trim_end_matches(".md");
-    discover_prompts(cwd, scope)
-        .into_iter()
-        .find(|prompt| prompt.name == normalized)
-}

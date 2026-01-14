@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout};
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -219,11 +219,22 @@ impl AppServerClient {
         let mut buffer = String::new();
         let mut plan_message: Option<String> = None;
         let mut turn_error: Option<String> = None;
+        let start = Instant::now();
+        let mut saw_output = false;
         loop {
-            let next = self
-                .next_event()
-                .await
-                .ok_or_else(|| anyhow!("event stream ended"))?;
+            let next = match timeout(Duration::from_secs(15), self.next_event()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => return Err(anyhow!("event stream ended")),
+                Err(_) => {
+                    if saw_output {
+                        break;
+                    }
+                    if start.elapsed() > Duration::from_secs(600) {
+                        return Err(anyhow!("turn timed out"));
+                    }
+                    continue;
+                }
+            };
             let method = next
                 .get("method")
                 .and_then(|value| value.as_str())
@@ -232,8 +243,13 @@ impl AppServerClient {
             match method {
                 _ if method.contains("requestApproval") => {
                     if let Some(id) = next.get("id").and_then(|value| value.as_u64()) {
+                        let decision = if method == "item/fileChange/requestApproval" {
+                            "accept"
+                        } else {
+                            "approved"
+                        };
                         let _ = self
-                            .send_response(id, json!({ "decision": "accept" }))
+                            .send_response(id, json!({ "decision": decision }))
                             .await;
                     }
                 }
@@ -255,6 +271,7 @@ impl AppServerClient {
                         ) {
                             if let Some(text) = extract_item_text(item) {
                                 last_message = text;
+                                saw_output = true;
                             }
                         }
                     }
@@ -262,6 +279,7 @@ impl AppServerClient {
                 "turn/plan/updated" => {
                     if let Some(plan) = next.get("params").and_then(|params| params.get("plan")) {
                         plan_message = Some(plan.to_string());
+                        saw_output = true;
                     }
                 }
                 "error" => {
@@ -272,6 +290,7 @@ impl AppServerClient {
                         .and_then(|msg| msg.as_str())
                     {
                         turn_error = Some(message.to_string());
+                        saw_output = true;
                     }
                 }
                 "codex/event/error" => {
@@ -282,7 +301,21 @@ impl AppServerClient {
                         .and_then(|text| text.as_str())
                     {
                         turn_error = Some(message.to_string());
+                        saw_output = true;
                     }
+                }
+                "codex/event/task_complete" => {
+                    if last_message.trim().is_empty() {
+                        if let Some(text) = next
+                            .get("params")
+                            .and_then(|params| params.get("msg"))
+                            .and_then(|msg| msg.get("last_agent_message"))
+                            .and_then(|value| value.as_str())
+                        {
+                            last_message = text.to_string();
+                        }
+                    }
+                    break;
                 }
                 "turn/completed" => {
                     let event_turn_id = next

@@ -4,13 +4,12 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tokio::time::{Duration, timeout};
 
 use crate::agent::{
     AgentConfig, AgentScope, AgentSource, discover_agents, format_agent_list, parse_agent_scope,
 };
 use crate::app_server::AppServerClient;
-use crate::prompts::find_prompt;
+use crate::prompts::discover_prompts;
 
 const DEFAULT_MAX_WORKERS: usize = 10;
 
@@ -47,6 +46,7 @@ pub struct SubagentArgs {
     #[serde(rename = "sandboxMode", default)]
     pub sandbox_mode: Option<String>,
     #[serde(rename = "plannerAgent", default)]
+    #[allow(dead_code)]
     pub planner_agent: Option<String>,
 }
 
@@ -122,18 +122,8 @@ impl SubagentExecutor {
                 .task
                 .clone()
                 .ok_or_else(|| anyhow!("auto mode requires `task`"))?;
-            let plan = self
-                .plan_tasks(
-                    &base_cwd,
-                    &agent_map,
-                    approval_policy,
-                    sandbox_mode,
-                    args.workflow.as_deref(),
-                    args.planner_agent.as_deref(),
-                    overall_task,
-                    scope,
-                )
-                .await?;
+            let plan =
+                self.build_auto_plan(&base_cwd, scope, args.workflow.as_deref(), &overall_task)?;
             return self
                 .execute_plan(
                     &base_cwd,
@@ -214,101 +204,61 @@ impl SubagentExecutor {
         ))
     }
 
-    async fn plan_tasks(
+    fn build_auto_plan(
         &self,
         cwd: &Path,
-        agent_map: &std::collections::HashMap<String, AgentConfig>,
-        approval_policy: &str,
-        sandbox_mode: &str,
-        workflow: Option<&str>,
-        planner_agent: Option<&str>,
-        task: String,
         scope: AgentScope,
+        workflow: Option<&str>,
+        task: &str,
     ) -> Result<Value> {
-        let planner_name = planner_agent.unwrap_or("planner");
-        let planner = agent_map
-            .get(planner_name)
-            .ok_or_else(|| anyhow!("planner agent not found: {planner_name}"))?;
-        let prompt = workflow
-            .and_then(|name| find_prompt(cwd, scope, name))
-            .map(|prompt| prompt.body);
+        let normalized = workflow
+            .map(|name| name.trim().trim_end_matches(".md"))
+            .filter(|name| !name.is_empty());
 
-        let mut instruction = String::new();
-        instruction.push_str("You are a planning agent.\n");
-        instruction.push_str("Create a subagent execution plan in JSON.\n");
-        instruction.push_str("Output ONLY valid JSON with no extra text.\n");
-        instruction.push_str("Max tasks: 10. Use only available agents.\n");
-        instruction.push_str("Do not use placeholders like \"...\" in agent/task/cwd.\n");
-        instruction
-            .push_str("The cwd field is optional; omit it unless you need a specific path.\n");
-        instruction.push_str(
-            "If unsure, return a single plan with agent \"worker\" and task equal to the user goal.\n",
-        );
-        instruction.push_str(
-            "Valid formats: single plan with keys mode/agent/task/(optional cwd), parallel plan with mode/tasks, chain plan with mode/chain.\n",
-        );
-        if let Some(prompt) = prompt.as_deref() {
-            instruction.push_str("\nWorkflow preset instructions:\n");
-            instruction.push_str(prompt);
-            instruction.push('\n');
-        }
-
-        let agent_names = agent_map.keys().cloned().collect::<Vec<_>>();
-        instruction.push_str("\nAgent names must be one of: ");
-        instruction.push_str(&agent_names.join(", "));
-        instruction.push('\n');
-
-        let available = agent_map
-            .values()
-            .map(|agent| format!("- {}: {}", agent.name, agent.description))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let planner_task =
-            format!("{instruction}\nAvailable agents:\n{available}\n\nUser goal:\n{task}");
-
-        let mut last_err = None;
-        for attempt in 0..2 {
-            let mut task_text = planner_task.clone();
-            if attempt > 0 {
-                task_text.push_str(
-                    "\nPrevious output was invalid. Return JSON with real agent names and real tasks. Do not use placeholders like \"...\".\n",
+        match normalized {
+            None => Ok(json!({
+                "mode": "single",
+                "agent": "worker",
+                "task": task
+            })),
+            Some("implement") => Ok(json!({
+                "mode": "single",
+                "agent": "worker",
+                "task": task
+            })),
+            Some("implement-and-review") => Ok(json!({
+                "mode": "chain",
+                "chain": [
+                    { "agent": "worker", "task": task },
+                    { "agent": "reviewer", "task": "Review the implementation based on the previous output:\n{previous}" }
+                ]
+            })),
+            Some("scout-and-plan") => Ok(json!({
+                "mode": "chain",
+                "chain": [
+                    { "agent": "scout", "task": format!("Find all code relevant to: {}", task) },
+                    { "agent": "planner", "task": format!("Create an implementation plan for \"{}\" using the context from the previous step:\n{{previous}}", task) }
+                ]
+            })),
+            Some(name) => {
+                let prompt_names = discover_prompts(cwd, scope)
+                    .into_iter()
+                    .map(|prompt| prompt.name)
+                    .collect::<Vec<_>>();
+                let builtins = ["implement", "implement-and-review", "scout-and-plan"];
+                let mut message = format!(
+                    "workflow '{name}' is not supported in auto mode. Built-ins: {}.",
+                    builtins.join(", ")
                 );
-            }
-            let result = timeout(
-                Duration::from_secs(20),
-                self.run_agent_task(
-                    cwd,
-                    planner,
-                    &task_text,
-                    approval_policy,
-                    sandbox_mode,
-                    None,
-                    Some(""),
-                    None,
-                ),
-            )
-            .await;
-            match result {
-                Ok(Ok(output)) => match parse_json_payload(&output.output)
-                    .and_then(|value| validate_plan(&value).map(|_| value))
-                {
-                    Ok(value) => return Ok(value),
-                    Err(err) => last_err = Some(err),
-                },
-                Ok(Err(err)) => last_err = Some(err),
-                Err(_) => last_err = Some(anyhow!("planner timed out")),
+                if !prompt_names.is_empty() {
+                    message.push_str(" Prompt files found: ");
+                    message.push_str(&prompt_names.join(", "));
+                    message.push('.');
+                }
+                message.push_str(" Use explicit chain/tasks for custom workflows.");
+                Err(anyhow!(message))
             }
         }
-        let fallback = json!({
-            "mode": "single",
-            "agent": "worker",
-            "task": task
-        });
-        if last_err.is_some() {
-            return Ok(fallback);
-        }
-        Err(anyhow!("planner did not return a valid plan"))
     }
 
     async fn execute_plan(
@@ -532,33 +482,6 @@ impl SubagentExecutor {
         )
         .await
     }
-
-    async fn run_agent_task(
-        &self,
-        base_cwd: &Path,
-        agent: &AgentConfig,
-        task: &str,
-        approval_policy: &str,
-        sandbox_mode: &str,
-        cwd_override: Option<&str>,
-        prompt_prefix: Option<&str>,
-        output_schema: Option<Value>,
-    ) -> Result<AgentExecutionResult> {
-        let cwd = cwd_override
-            .map(PathBuf::from)
-            .unwrap_or_else(|| base_cwd.to_path_buf());
-        run_task_internal(
-            &self.codex_bin,
-            &cwd,
-            agent,
-            task,
-            approval_policy,
-            sandbox_mode,
-            prompt_prefix,
-            output_schema,
-        )
-        .await
-    }
 }
 
 fn parse_task_item(value: &Value) -> Result<TaskItem> {
@@ -579,112 +502,6 @@ fn parse_task_item(value: &Value) -> Result<TaskItem> {
         task: task.to_string(),
         cwd,
     })
-}
-
-fn parse_json_payload(output: &str) -> Result<Value> {
-    if let Ok(value) = serde_json::from_str(output) {
-        return Ok(value);
-    }
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("planner output was empty"));
-    }
-    let start = output.find('{').ok_or_else(|| {
-        anyhow!(
-            "planner did not return JSON. output: {}",
-            truncate_output(trimmed)
-        )
-    })?;
-    let slice = &output[start..];
-    let mut deserializer = serde_json::Deserializer::from_str(slice);
-    Value::deserialize(&mut deserializer).map_err(|err| {
-        anyhow!(
-            "failed to parse JSON: {err}. output: {}",
-            truncate_output(slice)
-        )
-    })
-}
-
-fn truncate_output(output: &str) -> String {
-    let mut text = output.replace('\n', "\\n");
-    if text.len() > 500 {
-        text.truncate(500);
-        text.push_str("...");
-    }
-    text
-}
-
-fn validate_plan(value: &Value) -> Result<()> {
-    let mode = value
-        .get("mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("parallel");
-    match mode {
-        "single" => {
-            let agent = value.get("agent").and_then(|v| v.as_str());
-            let task = value.get("task").and_then(|v| v.as_str());
-            if agent.is_none() || task.is_none() {
-                return Err(anyhow!("single plan requires agent + task"));
-            }
-            if is_placeholder(agent.unwrap()) || is_placeholder(task.unwrap()) {
-                return Err(anyhow!("single plan contains placeholders"));
-            }
-            if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str()) {
-                if is_placeholder(cwd) {
-                    return Err(anyhow!("single plan contains placeholder cwd"));
-                }
-            }
-        }
-        "chain" => {
-            let chain = value.get("chain").and_then(|v| v.as_array());
-            if chain.is_none() {
-                return Err(anyhow!("chain plan requires chain[]"));
-            }
-            for item in chain.unwrap() {
-                validate_task_item(item)?;
-            }
-        }
-        _ => {
-            let tasks = value.get("tasks").and_then(|v| v.as_array());
-            if tasks.is_none() {
-                return Err(anyhow!("parallel plan requires tasks[]"));
-            }
-            for item in tasks.unwrap() {
-                validate_task_item(item)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_task_item(item: &Value) -> Result<()> {
-    let agent = item
-        .get("agent")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("task missing agent"))?;
-    let task = item
-        .get("task")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("task missing task"))?;
-    if is_placeholder(agent) || is_placeholder(task) {
-        return Err(anyhow!("task contains placeholders"));
-    }
-    if let Some(cwd) = item.get("cwd").and_then(|v| v.as_str()) {
-        if is_placeholder(cwd) {
-            return Err(anyhow!("task contains placeholder cwd"));
-        }
-    }
-    Ok(())
-}
-
-fn is_placeholder(value: &str) -> bool {
-    let trimmed = value.trim();
-    trimmed.is_empty()
-        || trimmed == "..."
-        || trimmed.contains("...")
-        || (trimmed.starts_with('<') && trimmed.ends_with('>'))
-        || trimmed.contains("<agent>")
-        || trimmed.contains("<task>")
 }
 
 async fn run_task(
@@ -723,7 +540,6 @@ async fn run_task(
         approval_policy,
         sandbox_mode,
         None,
-        None,
     )
     .await
 }
@@ -735,7 +551,6 @@ async fn run_task_internal(
     task: &str,
     approval_policy: &str,
     sandbox_mode: &str,
-    prompt_prefix: Option<&str>,
     output_schema: Option<Value>,
 ) -> Result<AgentExecutionResult> {
     let sandbox = agent
@@ -753,13 +568,7 @@ async fn run_task_internal(
     };
     let model = agent.model.as_deref().filter(|name| name.contains("codex"));
 
-    let input_task = if let Some(prefix) = prompt_prefix {
-        if prefix.trim().is_empty() {
-            task.to_string()
-        } else {
-            format!("{prefix}\n\n{task}")
-        }
-    } else if agent.system_prompt.trim().is_empty() {
+    let input_task = if agent.system_prompt.trim().is_empty() {
         task.to_string()
     } else {
         format!("{}\n\n{}", agent.system_prompt, task)

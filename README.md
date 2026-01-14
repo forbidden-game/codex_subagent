@@ -8,7 +8,7 @@ supports workflow presets from `~/.pi/agent/prompts` and `.pi/prompts`.
 
 - Process-level isolation per subagent.
 - Parallel and chain execution.
-- Auto planning (planner agent decides tasks).
+- Auto mode with built-in workflow mappings (or single worker fallback).
 - CLI-only, works as an MCP server for Codex.
 
 ## Build
@@ -36,7 +36,7 @@ Restart Codex, then the `subagent` tool will be available.
 
 ## Tool usage
 
-### Auto (planner decides)
+### Auto (built-in workflow mapping)
 
 ```json
 {
@@ -45,6 +45,9 @@ Restart Codex, then the `subagent` tool will be available.
   "workflow": "implement"
 }
 ```
+
+Built-in workflow names: `implement`, `implement-and-review`, `scout-and-plan`.
+Custom workflows should be invoked via explicit `chain` or `tasks`.
 
 ### Explicit parallel
 

@@ -122,7 +122,7 @@ fn subagent_tool_definition() -> Value {
                     "type": "string",
                     "enum": ["auto", "explicit"],
                     "default": "auto",
-                    "description": "auto = planner decides tasks, explicit = provide tasks/chain/single."
+                    "description": "auto = built-in workflow mapping (or single worker), explicit = provide tasks/chain/single."
                 },
                 "workflow": {
                     "type": "string",
@@ -180,7 +180,7 @@ fn subagent_tool_definition() -> Value {
                 },
                 "plannerAgent": {
                     "type": "string",
-                    "description": "Agent name used for auto planning. Defaults to 'planner'."
+                    "description": "Deprecated; auto mode does not invoke a planner."
                 }
             }
         }
